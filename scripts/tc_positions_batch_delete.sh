@@ -5,7 +5,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="v5"
+VERSION="v5.1"
 
 DEFAULT_TABLE="tc_positions"
 DEFAULT_TIME_COLUMN="devicetime"
@@ -26,6 +26,8 @@ TABLE_NAME="${TABLE_NAME:-$DEFAULT_TABLE}"
 TIME_COLUMN="${TIME_COLUMN:-$DEFAULT_TIME_COLUMN}"
 KEEP_START="${KEEP_START:-$DEFAULT_KEEP_START}"
 KEEP_END="${KEEP_END:-$DEFAULT_KEEP_END}"
+KEEP_START_MONTH="${KEEP_START_MONTH:-}"
+KEEP_END_MONTH="${KEEP_END_MONTH:-}"
 BATCH_SIZE="${BATCH_SIZE:-$DEFAULT_BATCH_SIZE}"
 SLEEP_BETWEEN_BATCHES="${SLEEP_BETWEEN_BATCHES:-$DEFAULT_SLEEP}"
 MAX_RETRIES="${MAX_RETRIES:-$DEFAULT_MAX_RETRIES}"
@@ -46,6 +48,7 @@ DRY_RUN="false"
 AUTO_CONFIRM="false"
 PASSWORD_FILE=""
 PROMPT_PASSWORD="false"
+KEEP_RANGE_SOURCE="explicit"
 
 usage() {
     cat <<'EOF'
@@ -67,6 +70,11 @@ Optional:
   --time-column COLUMN        Default: devicetime
   --keep-start "YYYY-MM-DD HH:MM:SS"
   --keep-end   "YYYY-MM-DD HH:MM:SS"
+  --keep-start-month "YYYY-MM"
+  --keep-end-month   "YYYY-MM"
+    If month options are used, the keep range is:
+      start = first day of start month 00:00:00
+      end   = first day of month after end month 00:00:00 (exclusive)
   --batch-size N              Default: 100000
   --sleep SECONDS             Default: 1
   --max-retries N             Default: 3
@@ -80,6 +88,7 @@ Optional:
 Environment alternatives:
   DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS
   TABLE_NAME, TIME_COLUMN, KEEP_START, KEEP_END
+  KEEP_START_MONTH, KEEP_END_MONTH
   BATCH_SIZE, SLEEP_BETWEEN_BATCHES, MAX_RETRIES
   SSL_MODE, SSL_CA
 EOF
@@ -110,6 +119,47 @@ format_number() {
     printf "%'d" "$1" 2>/dev/null || printf "%s" "$1"
 }
 
+validate_year_month() {
+    local ym="$1"
+    [[ "$ym" =~ ^[0-9]{4}-[0-9]{2}$ ]] || return 1
+    date -d "${ym}-01" +%Y-%m-%d >/dev/null 2>&1
+}
+
+resolve_keep_range() {
+    if [[ -n "$KEEP_START_MONTH" || -n "$KEEP_END_MONTH" ]]; then
+        require_cmd date
+        if [[ -z "$KEEP_START_MONTH" || -z "$KEEP_END_MONTH" ]]; then
+            die "Both --keep-start-month and --keep-end-month are required when using month-based ranges."
+        fi
+        validate_year_month "$KEEP_START_MONTH" || die "Invalid --keep-start-month. Use YYYY-MM."
+        validate_year_month "$KEEP_END_MONTH" || die "Invalid --keep-end-month. Use YYYY-MM."
+
+        local start_epoch
+        local end_epoch
+        start_epoch="$(date -d "${KEEP_START_MONTH}-01 00:00:00" +%s)"
+        end_epoch="$(date -d "${KEEP_END_MONTH}-01 00:00:00" +%s)"
+        if [[ "$end_epoch" -lt "$start_epoch" ]]; then
+            die "--keep-end-month must be the same as or after --keep-start-month."
+        fi
+
+        KEEP_START="$(date -d "${KEEP_START_MONTH}-01" '+%Y-%m-%d 00:00:00')"
+        KEEP_END="$(date -d "${KEEP_END_MONTH}-01 +1 month" '+%Y-%m-%d 00:00:00')"
+        KEEP_RANGE_SOURCE="month ${KEEP_START_MONTH}..${KEEP_END_MONTH} (end exclusive)"
+    fi
+}
+
+validate_keep_range() {
+    require_cmd date
+    [[ -n "$KEEP_START" && -n "$KEEP_END" ]] || die "KEEP_START and KEEP_END must be set."
+    local start_epoch
+    local end_epoch
+    start_epoch="$(date -d "$KEEP_START" +%s 2>/dev/null)" || die "Invalid KEEP_START format."
+    end_epoch="$(date -d "$KEEP_END" +%s 2>/dev/null)" || die "Invalid KEEP_END format."
+    if [[ "$end_epoch" -le "$start_epoch" ]]; then
+        die "KEEP_END must be after KEEP_START."
+    fi
+}
+
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -124,6 +174,8 @@ parse_args() {
             --time-column) TIME_COLUMN="$2"; shift 2 ;;
             --keep-start) KEEP_START="$2"; shift 2 ;;
             --keep-end) KEEP_END="$2"; shift 2 ;;
+            --keep-start-month) KEEP_START_MONTH="$2"; shift 2 ;;
+            --keep-end-month) KEEP_END_MONTH="$2"; shift 2 ;;
             --batch-size) BATCH_SIZE="$2"; shift 2 ;;
             --sleep) SLEEP_BETWEEN_BATCHES="$2"; shift 2 ;;
             --max-retries) MAX_RETRIES="$2"; shift 2 ;;
@@ -387,6 +439,8 @@ main() {
     fi
 
     load_password
+    resolve_keep_range
+    validate_keep_range
     validate_config
     create_mysql_cnf
 
@@ -395,7 +449,7 @@ main() {
     log_info "Database: $DB_NAME"
     log_info "Table: $TABLE_NAME"
     log_info "Time column: $TIME_COLUMN"
-    log_info "Keep range: $KEEP_START to $KEEP_END"
+    log_info "Keep range: $KEEP_START to $KEEP_END ($KEEP_RANGE_SOURCE)"
     log_info "Batch size: $(format_number "$BATCH_SIZE")"
     log_info "SSL mode: $SSL_MODE"
     log_info "Log file: $LOG_FILE"
